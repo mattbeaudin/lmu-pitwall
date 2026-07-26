@@ -76,7 +76,7 @@ check-bridge:
 ## Build the React dashboard (production)
 build-dashboard:
 	@echo "Building React dashboard..."
-	cd $(DASHBOARD_DIR) && npm run build
+	cd $(DASHBOARD_DIR) && . $$HOME/.nvm/nvm.sh && nvm use && npm run build
 	@echo "Built: $(DASHBOARD_DIR)/dist/"
 
 ## Build everything
@@ -88,12 +88,12 @@ dev: dev-dashboard
 
 dev-dashboard:
 	@echo "Starting Vite dev server on http://0.0.0.0:5173 ..."
-	cd $(DASHBOARD_DIR) && npm run dev
+	cd $(DASHBOARD_DIR) && . $$HOME/.nvm/nvm.sh && nvm use && npm run dev
 
 ## Install all dependencies
 install-deps:
-	@echo "Installing dashboard dependencies..."
-	cd $(DASHBOARD_DIR) && npm install
+	@echo "Installing dashboard Node.js version via nvm..."
+	cd $(DASHBOARD_DIR) && . $$HOME/.nvm/nvm.sh && nvm install && nvm use && npm install
 	@echo "Installing cargo-zigbuild (zig-based cross-compilation)..."
 	cargo install cargo-zigbuild
 	@echo "Adding Windows cross-compile target..."

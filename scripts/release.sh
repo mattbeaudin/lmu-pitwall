@@ -32,6 +32,7 @@ done
 
 export PATH="$HOME/.local/bin:$PATH"
 source "$HOME/.cargo/env"
+[[ -s "$HOME/.nvm/nvm.sh" ]] && source "$HOME/.nvm/nvm.sh"
 
 cd "$REPO_DIR"
 
@@ -46,7 +47,7 @@ echo "Version: $VER"
 # ── 2. Build React dashboard ───────────────────────────────────────────────
 echo ""
 echo "=== Building React dashboard ==="
-cd "$DASHBOARD_DIR" && npm run build
+cd "$DASHBOARD_DIR" && nvm use && npm run build
 cd "$REPO_DIR"
 
 # ── 3. Build Rust bridge (Windows .exe) ────────────────────────────────────

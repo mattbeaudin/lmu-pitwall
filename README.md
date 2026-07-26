@@ -125,8 +125,8 @@ rustup target add x86_64-pc-windows-gnu
 cargo install cargo-zigbuild
 # Zig 0.13+: https://ziglang.org/download/ or via dnf/distrobox
 
-# Node.js — use system package manager or https://nodejs.org
-cd dashboard && npm install && cd ..
+# Node.js — managed via nvm (https://github.com/nvm-sh/nvm)
+cd dashboard && nvm install && nvm use && npm install && cd ..
 ```
 
 **Build and release:**
