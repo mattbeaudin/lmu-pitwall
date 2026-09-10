@@ -128,7 +128,7 @@ fn build_status() -> ServerMessage {
         .collect();
     ServerMessage::EngineerStatus {
         piper_installed,
-        piper_version: config::PIPER_VERSION,
+        piper_version: config::PIPER_VERSION.to_string(),
         voices,
     }
 }

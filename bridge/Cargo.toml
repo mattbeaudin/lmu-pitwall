@@ -12,7 +12,9 @@ path = "src/main.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = "0.24"
+# rustls: the agent dials wss:// outbound. TLS for *inbound* viewer traffic is
+# terminated at a reverse proxy, not here.
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 rmp-serde = "1"
 serde = { version = "1", features = ["derive"] }

@@ -6,6 +6,40 @@
 - **Format:** MessagePack (binary, compact)
 - **Debug mode:** JSON via query param `?format=json`
 
+## Relay transport (agent → server)
+
+Optional second hop, used when the dashboard is served from a VPS instead of the
+driver's PC. The browser protocol below is **unchanged** — the relay unwraps
+every frame before it reaches a viewer socket.
+
+- **Agent** (`--relay-url wss://host/uplink --agent-key KEY`) reads shared memory
+  and streams what it would have broadcast locally.
+- **Server** (`--server`) serves the dashboard and accepts one agent on
+  `/uplink`. A second agent takes over; the previous one is dropped.
+
+**Auth.** The agent sends `Authorization: Bearer <key>`; a mismatch is answered
+`401` at the handshake. Viewers are unauthenticated — **anyone with the URL sees
+the telemetry.**
+
+**Framing.** Binary MessagePack, externally tagged (`ServerMessage` is itself
+internally tagged on `type`, and nesting the two in one map round-trips poorly):
+
+| Frame | Shape | Meaning |
+|-------|-------|---------|
+| `Hello` | `{"Hello":{"agent_version":"1.2.3"}}` | First frame after the handshake |
+| `Message` | `{"Message":{<ServerMessage>}}` | Fan out to every viewer |
+
+**Rate.** `--uplink-fps` (default 10) limits `TelemetryUpdate` and
+`ScoringUpdate` only. Event-driven messages are never dropped.
+
+**Relay rules.** `EngineerAudio` goes to the audio channel so `display_only`
+viewers never receive WAV payloads. `VersionInfo` is *not* relayed — the server
+reports its own version. `AllDriversUpdate` and `ConnectionStatus` also update
+the connect-time replay state so late-joining viewers see the session.
+
+Client→server commands (Post-Race, Fuel Calculator, Race Engineer) do not yet
+traverse the relay; they work only in local mode.
+
 ## Message Types
 
 All messages are tagged with a `type` field.

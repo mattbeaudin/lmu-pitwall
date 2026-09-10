@@ -13,6 +13,7 @@ mod lap_tracker;
 mod post_race;
 mod protocol;
 mod race_engineer;
+mod relay;
 mod rest_api;
 mod shared_memory;
 mod websocket;
@@ -27,7 +28,7 @@ use tokio::sync::{RwLock, watch};
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, warn};
 
-use config::Config;
+use config::{Config, Mode};
 use electronics::ElectronicsSnapshot;
 use fuel::{FuelSnapshot, FuelTracker};
 use lap_tracker::LapTracker;
@@ -1254,14 +1255,20 @@ async fn main() -> Result<()> {
     let config = Config::parse();
     let app_cfg = crate::app_config::AppConfig::load_or_create();
     let port: u16 = config.ws_port.or(app_cfg.port).unwrap_or(9000);
+    let mode = config.mode();
 
     // Single-instance guard: if the port already responds, check whether it is
     // the same version or an older one.
     //  • Same/newer version already running → exit silently (no duplicate tab).
     //  • Older version running → signal it to shut down, wait for the port to
     //    free up, then fall through to start the new server normally.
+    //
+    // Local mode only. A relay that finds its port taken should fail loudly
+    // rather than exit silently, and an agent may legitimately share a box.
     let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse()?;
-    if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok() {
+    if mode == Mode::Local
+        && std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok()
+    {
         let version_url = format!("http://127.0.0.1:{}/api/version", port);
         let running_version = ureq::get(&version_url)
             .call()
@@ -1341,13 +1348,25 @@ async fn main() -> Result<()> {
 
     info!("LMU Bridge v{}", env!("CARGO_PKG_VERSION"));
     info!(
-        "Config: port={} telemetry_fps={} scoring_fps={}",
-        port, config.telemetry_fps, config.scoring_fps
+        "Config: mode={:?} port={} telemetry_fps={} scoring_fps={}",
+        mode, port, config.telemetry_fps, config.scoring_fps
     );
+
+    // Both relay roles need the shared secret; neither can do anything useful
+    // without it, so fail at startup rather than at the first connection.
+    let agent_key = config.resolved_agent_key();
+    if mode != Mode::Local && agent_key.is_none() {
+        anyhow::bail!(
+            "an agent key is required in {:?} mode — pass --agent-key or set $PITWALL_AGENT_KEY",
+            mode
+        );
+    }
 
     // Watch channel for latest AllDriversUpdate (sent to new clients on connect).
     let (all_drivers_tx, all_drivers_rx) =
         tokio::sync::watch::channel::<Option<ServerMessage>>(None);
+    // Fed by task_broadcaster locally, by the relay room in server mode.
+    let mut all_drivers_tx = Some(all_drivers_tx);
 
     // Watch channel for VersionInfo (sent to new clients on connect once check completes).
     let (version_info_tx, version_info_rx) =
@@ -1357,16 +1376,22 @@ async fn main() -> Result<()> {
     // never see "Waiting" when LMU was already running before the dashboard opened).
     let (connection_status_tx, connection_status_rx) =
         tokio::sync::watch::channel::<Option<ServerMessage>>(None);
+    // Fed by task_polling locally, by the relay room in server mode.
+    let mut connection_status_tx = Some(connection_status_tx);
 
     let state = Arc::new(RwLock::new(TelemetryState::new()));
     let engineer_service = Arc::new(race_engineer::RaceEngineerService::new());
     let ws    = Arc::new(WebSocketServer::new(port, all_drivers_rx, version_info_rx, connection_status_rx, engineer_service.clone()));
 
+    // Tasks 1-3 read this machine's shared memory, so they exist on a driver's
+    // PC and not on the relay, which has no game to read.
+    if mode != Mode::Server {
     // Task 1 + 3: Shared memory polling + health check
     {
         let state = state.clone();
         let ws    = ws.clone();
         let ws_port = port;
+        let connection_status_tx = connection_status_tx.take().expect("local mode owns the sender");
         tokio::spawn(async move { task_polling(state, ws, ws_port, connection_status_tx).await });
     }
 
@@ -1377,24 +1402,49 @@ async fn main() -> Result<()> {
         let tel_fps         = config.telemetry_fps;
         let scoring_fps     = config.scoring_fps;
         let engineer_svc    = engineer_service.clone();
+        let all_drivers_tx  = all_drivers_tx.take().expect("local mode owns the sender");
         tokio::spawn(async move {
             task_broadcaster(state, ws, tel_fps, scoring_fps, all_drivers_tx, engineer_svc).await
         });
     }
+    }
 
-    // Combined HTTP + WebSocket server
-    {
+    // Agent mode: forward everything the broadcaster produces to the relay.
+    if mode == Mode::Agent {
+        let ws = ws.clone();
+        let relay_url = config.relay_url.clone().expect("agent mode implies --relay-url");
+        let key = agent_key.clone().expect("checked above");
+        let fps = config.uplink_fps;
+        tokio::spawn(async move { relay::task_uplink(ws, relay_url, key, fps).await });
+    }
+
+    // Server mode: the room replaces the polling tasks as the source of truth.
+    let relay_room = if mode == Mode::Server {
+        Some(Arc::new(relay::RelayRoom::new(
+            agent_key.clone().expect("checked above"),
+            ws.clone(),
+            all_drivers_tx.take().expect("server mode owns the sender"),
+            connection_status_tx.take().expect("server mode owns the sender"),
+        )))
+    } else {
+        None
+    };
+
+    // Combined HTTP + WebSocket server. An agent with --headless serves nothing
+    // locally; every other mode does.
+    if !(mode == Mode::Agent && config.headless) {
         let ws   = ws.clone();
         let http_port = port;
+        let relay = relay_room.clone();
         tokio::spawn(async move {
-            if let Err(e) = http_server::run(ws, http_port).await {
+            if let Err(e) = http_server::run(ws, http_port, relay).await {
                 tracing::error!("HTTP server error: {}", e);
             }
         });
     }
 
     // Optionally open the browser after a short delay to let the server bind.
-    if !config.no_browser {
+    if mode == Mode::Local && !config.no_browser {
         let url = format!("http://localhost:{}", port);
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -1451,7 +1501,10 @@ async fn main() -> Result<()> {
     // When the count drops to 0 (last tab closed), a 45-second grace period
     // starts so that a normal page refresh doesn't trigger a shutdown.
     // If no client reconnects within that window, the process exits.
-    {
+    //
+    // Local mode only. A relay must outlive the last viewer tab, and an agent
+    // must keep streaming whether or not anyone is watching locally.
+    if mode == Mode::Local {
         let count_rx = ws.client_count_rx();
         tokio::spawn(async move {
             auto_shutdown(count_rx).await;

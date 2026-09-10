@@ -15,10 +15,15 @@ use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, info, warn};
 
 use crate::assets::Asset;
+use crate::relay::RelayRoom;
 use crate::websocket::server::WebSocketServer;
 
 /// Bind on `0.0.0.0:port` and serve HTTP + WebSocket connections.
-pub async fn run(ws: Arc<WebSocketServer>, port: u16) -> Result<()> {
+///
+/// `relay` is `Some` only in server mode. Its presence both enables the
+/// `/uplink` route and disables the process-control API routes, which are safe
+/// on a driver's LAN but not on a public address.
+pub async fn run(ws: Arc<WebSocketServer>, port: u16, relay: Option<Arc<RelayRoom>>) -> Result<()> {
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = TcpListener::bind(addr).await?;
     info!(
@@ -30,8 +35,9 @@ pub async fn run(ws: Arc<WebSocketServer>, port: u16) -> Result<()> {
         match listener.accept().await {
             Ok((stream, peer)) => {
                 let ws = ws.clone();
+                let relay = relay.clone();
                 tokio::spawn(async move {
-                    handle_connection(stream, peer, ws, port).await;
+                    handle_connection(stream, peer, ws, port, relay).await;
                 });
             }
             Err(e) => {
@@ -41,7 +47,13 @@ pub async fn run(ws: Arc<WebSocketServer>, port: u16) -> Result<()> {
     }
 }
 
-async fn handle_connection(stream: TcpStream, peer: SocketAddr, ws: Arc<WebSocketServer>, port: u16) {
+async fn handle_connection(
+    stream: TcpStream,
+    peer: SocketAddr,
+    ws: Arc<WebSocketServer>,
+    port: u16,
+    relay: Option<Arc<RelayRoom>>,
+) {
     // Peek without consuming so the WS handshake can re-read the same bytes.
     let mut buf = [0u8; 4096];
     let n = match stream.peek(&mut buf).await {
@@ -56,9 +68,13 @@ async fn handle_connection(stream: TcpStream, peer: SocketAddr, ws: Arc<WebSocke
 
     if preview.contains("upgrade: websocket") {
         // WebSocket upgrade — tokio-tungstenite will re-read the request.
-        ws.accept_client(stream, peer);
+        // The agent uplink is told apart from a viewer by path alone.
+        match (&relay, parse_path(&preview).as_str()) {
+            (Some(room), "/uplink") => room.accept_agent(stream, peer),
+            _ => ws.accept_client(stream, peer),
+        }
     } else {
-        if let Err(e) = handle_http(stream, port).await {
+        if let Err(e) = handle_http(stream, port, relay.is_some()).await {
             debug!("HTTP handler error from {}: {}", peer, e);
         }
     }
@@ -68,7 +84,7 @@ async fn handle_connection(stream: TcpStream, peer: SocketAddr, ws: Arc<WebSocke
 // Minimal HTTP/1.1 static-file handler
 // ---------------------------------------------------------------------------
 
-async fn handle_http(mut stream: TcpStream, port: u16) -> Result<()> {
+async fn handle_http(mut stream: TcpStream, port: u16, server_mode: bool) -> Result<()> {
     // Read until end of HTTP headers (\r\n\r\n).
     let mut request = Vec::with_capacity(2048);
     let mut buf = [0u8; 4096];
@@ -130,6 +146,15 @@ async fn handle_http(mut stream: TcpStream, port: u16) -> Result<()> {
             ("Access-Control-Allow-Methods", "GET, OPTIONS"),
         ];
         send_response(&mut stream, 200, "application/json", body.as_bytes(), &cors).await?;
+        return Ok(());
+    }
+
+    // Both of the routes below hand process control to whoever calls them and
+    // neither is authenticated. That is fine on a driver's own machine, and
+    // fatal on a public relay — one curl would kill the room for everyone.
+    if server_mode && (path == "/api/shutdown" || path == "/api/set-port") {
+        let cors = [("Access-Control-Allow-Origin", "*")];
+        send_response(&mut stream, 404, "text/plain", b"Not Found", &cors).await?;
         return Ok(());
     }
 
