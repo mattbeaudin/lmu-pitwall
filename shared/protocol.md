@@ -30,6 +30,7 @@ internally tagged on `type`, and nesting the two in one map round-trips poorly):
 | `Message` | `{"Message":{<ServerMessage>}}` | Agent → server. Fan out to every viewer |
 | `Command` | `{"Command":{"req":7,"cmd":{<ClientCommand>}}}` | Server → agent. Run this on the driver's PC |
 | `Response` | `{"Response":{"req":7,"msg":{<ServerMessage>}}}` | Agent → server. Answer for exactly one viewer |
+| `Broadcast` | `{"Broadcast":{"cmd":{<ClientCommand>}}}` | Server → agent. Run this; the result goes to everyone |
 
 **Rate.** `--uplink-fps` (default 10) limits `TelemetryUpdate` and
 `ScoringUpdate` only. Event-driven messages are never dropped.
@@ -40,18 +41,35 @@ reports its own version. `AllDriversUpdate` and `ConnectionStatus` also update
 the connect-time replay state so late-joining viewers see the session.
 
 **Commands.** Post-Race and Fuel Calculator commands make a round trip to the
-agent; every other command class, including the Race Engineer's, stays local.
-`ClientCommand` has no request id, so the server allocates `req` and matches the
-`Response` back to the viewer that asked — the browser protocol is unchanged and
-a viewer's identity never goes on the wire.
+agent. `ClientCommand` has no request id, so the server allocates `req` and
+matches the `Response` back to the viewer that asked — the browser protocol is
+unchanged and a viewer's identity never goes on the wire.
 
 `PostRaceInit` waits 30 s (a cold import parses every result XML), everything
 else 10 s. On timeout, or with no agent connected, the viewer gets
 `PostRaceError` or `FuelCalcError` — whichever its panel renders.
 
+**Race Engineer.** Its commands go down as `Broadcast` instead: they have no
+single answer — the agent's `EngineerStatus`, `EngineerAudio` and install
+progress are broadcast to every viewer and come back up as ordinary `Message`
+frames. `EngineerRegisterClientRole` is the exception and stays per-socket on
+the server; it is never forwarded.
+
+Behaviour is **one global setting, last writer wins**. Two viewers with
+different engineer settings overwrite each other, and the rule engine holds only
+the most recent. The server stores the last `EngineerUpdateBehavior` and replays
+it whenever an agent says `Hello`, so a reconnect or a driver handover does not
+silently revert everything to defaults. Per-viewer profiles are not a thing.
+
+`EngineerInstallPiper`, `EngineerInstallVoice` and `EngineerUninstallVoice`
+download and unpack a binary onto the driver's PC, or delete files. Viewers are
+unauthenticated, so the agent **refuses them** with `EngineerError` unless it
+was started with `--allow-remote-install`. The decision belongs to the machine
+at risk; installing from the agent's own dashboard is unaffected.
+
 **Limits.** Viewers are unauthenticated, so each socket is capped at 5 commands
-per second and the agent runs at most 4 at once; over either limit the answer is
-the same error variant, not silence.
+per second and the agent runs at most 4 correlated commands at once; over either
+limit the answer is an error variant, not silence.
 
 ## Message Types
 

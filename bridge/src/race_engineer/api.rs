@@ -17,6 +17,13 @@ use super::voice_manager;
 use super::DownloadProgress;
 use super::RaceEngineerService;
 
+/// Longest text a single synthesis request may carry.
+///
+/// Every callout the rule engine produces is one sentence; this is generous
+/// for that and small enough that a client cannot turn one message into a
+/// large WAV on the driver's upstream link.
+const MAX_SYNTHESIS_CHARS: usize = 500;
+
 /// Dispatch an engineer ClientCommand.
 ///
 /// Long-running operations (install, synthesize) are spawned as background
@@ -79,6 +86,22 @@ pub async fn handle_command(
             text,
             request_id,
         } => {
+            // A callout is a sentence. Anyone who can reach this socket can
+            // spend the driver's CPU and upstream bandwidth on the result, so
+            // the length is capped rather than trusted.
+            if text.len() > MAX_SYNTHESIS_CHARS {
+                warn!("Refusing a {}-byte synthesis request", text.len());
+                broadcast_msg(
+                    &audio_broadcaster,
+                    ServerMessage::EngineerError {
+                        message: format!(
+                            "Text too long — {} characters at most",
+                            MAX_SYNTHESIS_CHARS
+                        ),
+                    },
+                );
+                return;
+            }
             tokio::spawn(async move {
                 run_synthesize(service, audio_broadcaster, voice_id, text, request_id).await;
             });

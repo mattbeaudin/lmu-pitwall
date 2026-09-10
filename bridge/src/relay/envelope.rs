@@ -31,6 +31,9 @@ pub enum DownlinkFrame {
     /// `req` is allocated by the server; the agent only echoes it back, so a
     /// viewer's identity never goes on the wire.
     Command { req: u64, cmd: ClientCommand },
+    /// Run this command on the driver's PC. Its result is broadcast to every
+    /// viewer, so there is nothing to correlate and no answer to wait for.
+    Broadcast { cmd: ClientCommand },
 }
 
 #[cfg(test)]
@@ -125,6 +128,25 @@ mod tests {
                 assert_eq!(req, 7);
                 assert_eq!(driver_id, 99);
             }
+            other => panic!("wrong frame after round-trip: {:?}", other),
+        }
+    }
+
+    /// Engineer commands take this frame instead: the agent broadcasts their
+    /// result, so there is no `req` to echo back.
+    #[test]
+    fn broadcast_frame_round_trips_through_msgpack() {
+        let original = DownlinkFrame::Broadcast {
+            cmd: ClientCommand::EngineerGetStatus,
+        };
+
+        let bytes = rmp_serde::to_vec_named(&original).unwrap();
+        let decoded: DownlinkFrame = rmp_serde::from_slice(&bytes).unwrap();
+
+        match decoded {
+            DownlinkFrame::Broadcast {
+                cmd: ClientCommand::EngineerGetStatus,
+            } => {}
             other => panic!("wrong frame after round-trip: {:?}", other),
         }
     }

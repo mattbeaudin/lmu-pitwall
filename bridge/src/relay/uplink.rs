@@ -18,7 +18,8 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
 
-use crate::protocol::messages::ServerMessage;
+use crate::protocol::messages::{ClientCommand, ServerMessage};
+use crate::race_engineer;
 use crate::relay::envelope::{DownlinkFrame, UplinkFrame};
 use crate::websocket::server::{command_error, execute_local, WebSocketServer};
 
@@ -39,6 +40,13 @@ const STABLE_CONNECTION_SECS: u64 = 60;
 /// SQLite on the driver's PC. Beyond this the agent answers "busy" instead.
 const MAX_INFLIGHT_COMMANDS: usize = 4;
 
+/// How many relayed engineer commands may be queued at once.
+///
+/// Synthesis is serialized behind the TTS engine's own lock, so this is not
+/// about parallelism — it bounds the backlog an anonymous viewer can build up
+/// while that lock is held.
+const MAX_INFLIGHT_BROADCASTS: usize = 8;
+
 /// Outbound frame queue depth for the writer task.
 const OUT_CAPACITY: usize = 64;
 
@@ -51,12 +59,13 @@ pub async fn task_uplink(
     relay_url: String,
     agent_key: String,
     uplink_fps: u32,
+    allow_remote_install: bool,
 ) {
     let mut attempt: u32 = 0;
 
     loop {
         let started = Instant::now();
-        match stream_once(&ws, &relay_url, &agent_key, uplink_fps).await {
+        match stream_once(&ws, &relay_url, &agent_key, uplink_fps, allow_remote_install).await {
             Ok(()) => warn!("Uplink to {} closed by the relay", relay_url),
             Err(e) => warn!("Uplink to {} failed: {}", relay_url, e),
         }
@@ -86,6 +95,7 @@ async fn stream_once(
     relay_url: &str,
     agent_key: &str,
     uplink_fps: u32,
+    allow_remote_install: bool,
 ) -> anyhow::Result<()> {
     // Subscribe before connecting so no message is missed during the handshake.
     let mut rx = ws.broadcaster().subscribe();
@@ -128,6 +138,7 @@ async fn stream_once(
     let mut throttle = Throttle::new(uplink_fps);
     let mut meter = Meter::new();
     let inflight = Arc::new(Semaphore::new(MAX_INFLIGHT_COMMANDS));
+    let broadcasts = Arc::new(Semaphore::new(MAX_INFLIGHT_BROADCASTS));
 
     loop {
         let msg = tokio::select! {
@@ -153,6 +164,15 @@ async fn stream_once(
                         match rmp_serde::from_slice::<DownlinkFrame>(&bytes) {
                             Ok(DownlinkFrame::Command { req, cmd }) => {
                                 spawn_command(req, cmd, &inflight, &out_tx);
+                            }
+                            Ok(DownlinkFrame::Broadcast { cmd }) => {
+                                spawn_broadcast(
+                                    cmd,
+                                    ws,
+                                    &out_tx,
+                                    &broadcasts,
+                                    allow_remote_install,
+                                );
                             }
                             Err(e) => warn!("Undecodable downlink frame: {}", e),
                         }
@@ -182,7 +202,7 @@ async fn stream_once(
 /// and blocking here would freeze every viewer's telemetry.
 fn spawn_command(
     req: u64,
-    cmd: crate::protocol::messages::ClientCommand,
+    cmd: ClientCommand,
     inflight: &Arc<Semaphore>,
     out_tx: &mpsc::Sender<Message>,
 ) {
@@ -204,6 +224,84 @@ fn spawn_command(
         send_response(&out_tx, req, msg).await;
         drop(permit);
     });
+}
+
+/// Run one relayed engineer command. Its result reaches viewers on the ordinary
+/// broadcast channels, which the uplink is already subscribed to, so nothing is
+/// sent back here.
+///
+/// Installs are the exception: they download and unpack a binary onto *this*
+/// PC, and relay viewers are unauthenticated. The gate lives here rather than
+/// on the server because this is the machine at risk, and its driver is the one
+/// who should decide.
+fn spawn_broadcast(
+    cmd: ClientCommand,
+    ws: &Arc<WebSocketServer>,
+    out_tx: &mpsc::Sender<Message>,
+    inflight: &Arc<Semaphore>,
+    allow_remote_install: bool,
+) {
+    if is_install(&cmd) && !allow_remote_install {
+        warn!("Refused a remote install request: {:?}", cmd);
+        let out_tx = out_tx.clone();
+        tokio::spawn(async move {
+            send_message(
+                &out_tx,
+                ServerMessage::EngineerError {
+                    message: "Installation must be done on the racing PC. Start the \
+                              agent with --allow-remote-install to permit it remotely."
+                        .to_string(),
+                },
+            )
+            .await;
+        });
+        return;
+    }
+
+    let permit = match inflight.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            warn!("Too many relayed engineer commands queued, dropping one");
+            let out_tx = out_tx.clone();
+            tokio::spawn(async move {
+                send_message(
+                    &out_tx,
+                    ServerMessage::EngineerError {
+                        message: "The agent is busy — try again".to_string(),
+                    },
+                )
+                .await;
+            });
+            return;
+        }
+    };
+
+    let svc = ws.engineer_service();
+    let bcast = ws.broadcaster();
+    let audio_bcast = ws.audio_broadcaster();
+    tokio::spawn(async move {
+        race_engineer::api::handle_command(cmd, svc, bcast, audio_bcast).await;
+        drop(permit);
+    });
+}
+
+/// Commands that write to the driver's filesystem.
+fn is_install(cmd: &ClientCommand) -> bool {
+    matches!(
+        cmd,
+        ClientCommand::EngineerInstallPiper
+            | ClientCommand::EngineerInstallVoice { .. }
+            | ClientCommand::EngineerUninstallVoice { .. }
+    )
+}
+
+async fn send_message(out_tx: &mpsc::Sender<Message>, msg: ServerMessage) {
+    match rmp_serde::to_vec_named(&UplinkFrame::Message(msg)) {
+        Ok(bytes) => {
+            let _ = out_tx.send(Message::Binary(bytes.into())).await;
+        }
+        Err(e) => warn!("Unserializable message: {}", e),
+    }
 }
 
 async fn send_response(out_tx: &mpsc::Sender<Message>, req: u64, msg: ServerMessage) {
