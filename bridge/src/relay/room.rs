@@ -11,7 +11,8 @@
 //! The room also carries viewer commands the other way. [`RelayRoom::request`]
 //! parks a `oneshot` under a fresh `req`, sends the command down to the agent
 //! and waits for the matching `Response` — that map is what keeps N viewers'
-//! answers from crossing.
+//! answers from crossing. Engineer commands go down as `Broadcast` instead:
+//! they have no single answer, so there is nothing to correlate.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -54,6 +55,10 @@ struct Downlink {
     next_req: AtomicU64,
     pending: Mutex<HashMap<u64, oneshot::Sender<ServerMessage>>>,
     sender: Mutex<Option<mpsc::Sender<DownlinkFrame>>>,
+    /// Last `EngineerUpdateBehavior` any viewer sent, replayed to every agent
+    /// that connects. The rule engine holds one global behaviour, so without
+    /// this a reconnect or a driver swap silently reverts it to defaults.
+    behavior: Mutex<Option<ClientCommand>>,
 }
 
 impl Downlink {
@@ -91,6 +96,33 @@ impl Downlink {
         }
     }
 
+    /// Send `cmd` to the agent without waiting: its result reaches viewers as
+    /// an ordinary broadcast.
+    async fn broadcast(&self, cmd: ClientCommand) -> Result<(), RequestError> {
+        if matches!(cmd, ClientCommand::EngineerUpdateBehavior { .. }) {
+            *self.behavior.lock().unwrap() = Some(cmd.clone());
+        }
+
+        let tx = self
+            .sender
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or(RequestError::NoAgent)?;
+
+        tx.send(DownlinkFrame::Broadcast { cmd })
+            .await
+            .map_err(|_| RequestError::NoAgent)
+    }
+
+    /// Re-send the stored behaviour to an agent that just said hello.
+    async fn replay_behavior(&self) {
+        let stored = self.behavior.lock().unwrap().clone();
+        if let Some(cmd) = stored {
+            let _ = self.broadcast(cmd).await;
+        }
+    }
+
     /// Hand one answer to the viewer that asked for it.
     fn resolve(&self, req: u64, msg: ServerMessage) {
         match self.pending.lock().unwrap().remove(&req) {
@@ -113,6 +145,9 @@ impl Downlink {
     /// Drop the channel and wake every waiter. Dropping the `oneshot` senders
     /// is what does the waking: `request` reads that as `NoAgent` and answers
     /// immediately instead of leaving a viewer to time out against a dead agent.
+    ///
+    /// `behavior` deliberately survives: replaying it to the next agent is the
+    /// whole point of storing it.
     fn detach(&self) {
         *self.sender.lock().unwrap() = None;
         self.pending.lock().unwrap().clear();
@@ -159,6 +194,11 @@ impl RelayRoom {
         timeout: Duration,
     ) -> Result<ServerMessage, RequestError> {
         self.downlink.request(cmd, timeout).await
+    }
+
+    /// Run one viewer command on the agent's PC, answer to everyone.
+    pub async fn broadcast(&self, cmd: ClientCommand) -> Result<(), RequestError> {
+        self.downlink.broadcast(cmd).await
     }
 
     /// Take over an already-accepted TCP connection on `/uplink`.
@@ -240,6 +280,7 @@ impl RelayRoom {
                             match rmp_serde::from_slice::<UplinkFrame>(&bytes) {
                                 Ok(UplinkFrame::Hello { agent_version }) => {
                                     info!("Agent {} says hello (v{})", peer, agent_version);
+                                    self.downlink.replay_behavior().await;
                                 }
                                 Ok(UplinkFrame::Message(msg)) => self.inject(msg),
                                 Ok(UplinkFrame::Response { req, msg }) => {
@@ -428,6 +469,7 @@ mod tests {
         });
         let first = match rx.recv().await.unwrap() {
             DownlinkFrame::Command { req, .. } => req,
+            other => panic!("unexpected frame: {:?}", other),
         };
 
         let b = tokio::spawn({
@@ -439,6 +481,7 @@ mod tests {
         });
         let second = match rx.recv().await.unwrap() {
             DownlinkFrame::Command { req, .. } => req,
+            other => panic!("unexpected frame: {:?}", other),
         };
         assert_ne!(first, second);
 
@@ -485,6 +528,55 @@ mod tests {
 
         downlink.detach();
         assert_eq!(waiter.await.unwrap().unwrap_err(), RequestError::NoAgent);
+    }
+
+    fn behavior_stub(enabled: bool) -> ClientCommand {
+        ClientCommand::EngineerUpdateBehavior {
+            enabled,
+            frequency: "normal".to_string(),
+            mute_in_qualifying: false,
+            debug_all_rules_in_practice: false,
+            active_voice_id: None,
+            pilot_name: None,
+            mute_name: false,
+        }
+    }
+
+    /// The rule engine holds one global behaviour, so an agent restart would
+    /// otherwise revert every setting to defaults with nobody to notice.
+    #[tokio::test]
+    async fn a_reconnecting_agent_is_sent_the_stored_behavior() {
+        let downlink = Downlink::default();
+        let (tx, mut rx) = mpsc::channel(8);
+        downlink.attach(tx);
+
+        downlink.broadcast(behavior_stub(true)).await.unwrap();
+        rx.recv().await.unwrap();
+
+        // The agent goes away and a new one connects.
+        downlink.detach();
+        let (tx, mut rx) = mpsc::channel(8);
+        downlink.attach(tx);
+        downlink.replay_behavior().await;
+
+        match rx.recv().await.unwrap() {
+            DownlinkFrame::Broadcast {
+                cmd: ClientCommand::EngineerUpdateBehavior { enabled, .. },
+            } => assert!(enabled),
+            other => panic!("unexpected frame: {:?}", other),
+        }
+    }
+
+    /// Nothing to broadcast to and nothing to wait for, so the viewer must be
+    /// told rather than left thinking the setting applied.
+    #[tokio::test]
+    async fn broadcast_without_an_agent_fails() {
+        let downlink = Downlink::default();
+        let err = downlink
+            .broadcast(ClientCommand::EngineerGetStatus)
+            .await
+            .unwrap_err();
+        assert_eq!(err, RequestError::NoAgent);
     }
 
     #[test]

@@ -59,6 +59,12 @@ pub struct Config {
     #[arg(long, default_value_t = false)]
     pub headless: bool,
 
+    /// Agent mode only — let relay viewers install Piper and voices on this
+    /// PC. Off by default: viewers are unauthenticated, and an install writes
+    /// a downloaded binary to the driver's machine.
+    #[arg(long, default_value_t = false)]
+    pub allow_remote_install: bool,
+
     /// Uplink send rate for telemetry and scoring frames. Deliberately lower
     /// than `--telemetry-fps`: the uplink runs over a home upstream link,
     /// where a full grid's `ScoringUpdate` is the dominant cost.

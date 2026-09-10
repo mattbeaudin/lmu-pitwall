@@ -34,7 +34,17 @@ pub fn list_voices() -> Vec<VoiceInstallStatus> {
 }
 
 pub fn is_installed(voice_id: &str) -> bool {
-    voice_model(voice_id).exists() && voice_config(voice_id).exists()
+    is_known(voice_id) && voice_model(voice_id).exists() && voice_config(voice_id).exists()
+}
+
+/// Whether `voice_id` names a voice in the catalog.
+///
+/// Every path built from a voice id must pass through here first. Ids arrive
+/// from unauthenticated clients, and `Path::join` with an absolute path throws
+/// the base directory away — so an unchecked id is not a name under
+/// `voices_dir()`, it is any path on the machine.
+pub fn is_known(voice_id: &str) -> bool {
+    VOICES.iter().any(|v| v.id == voice_id)
 }
 
 pub async fn install_voice(
@@ -107,6 +117,10 @@ pub async fn install_voice(
 }
 
 pub fn uninstall_voice(voice_id: &str) -> Result<()> {
+    if !is_known(voice_id) {
+        return Err(anyhow!("Unknown voice: {voice_id}"));
+    }
+
     let model = voice_model(voice_id);
     let cfg = voice_config(voice_id);
 
@@ -121,4 +135,25 @@ pub fn uninstall_voice(voice_id: &str) -> Result<()> {
 
     info!("Voice {voice_id} uninstalled");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Voice ids come from unauthenticated clients and are joined onto
+    /// `voices_dir()`. An absolute id would replace that base entirely, so an
+    /// unchecked id turns "uninstall a voice" into "delete this file".
+    #[test]
+    fn only_catalog_voices_can_be_uninstalled() {
+        assert!(uninstall_voice("/etc/passwd").is_err());
+        assert!(uninstall_voice("../../../../secret").is_err());
+        assert!(uninstall_voice("").is_err());
+    }
+
+    #[test]
+    fn an_unknown_voice_is_never_reported_installed() {
+        assert!(!is_installed("/etc/passwd"));
+        assert!(!is_known("../nope"));
+    }
 }

@@ -37,13 +37,24 @@ pub fn default_results_folder() -> Option<PathBuf> {
 
 /// Recursively scans `folder` for `.xml` files and returns their paths.
 /// Returns an empty Vec if the folder does not exist or is unreadable.
+/// How deep below the results folder the scan will go.
+///
+/// LMU nests results a couple of levels at most. The limit is really about
+/// what happens on a wrong folder: `is_dir()` follows symlinks and junctions,
+/// so a link pointing back at its own parent would otherwise recurse until the
+/// stack gives out.
+const MAX_SCAN_DEPTH: usize = 8;
+
 pub fn scan_results_folder(folder: &Path) -> Vec<PathBuf> {
     let mut result = Vec::new();
-    scan_recursive(folder, &mut result);
+    scan_recursive(folder, &mut result, 0);
     result
 }
 
-fn scan_recursive(dir: &Path, out: &mut Vec<PathBuf>) {
+fn scan_recursive(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
+    if depth > MAX_SCAN_DEPTH {
+        return;
+    }
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return,
@@ -51,7 +62,7 @@ fn scan_recursive(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in entries.filter_map(|e| e.ok()) {
         let path = entry.path();
         if path.is_dir() {
-            scan_recursive(&path, out);
+            scan_recursive(&path, out, depth + 1);
         } else if path.extension().and_then(|e| e.to_str()) == Some("xml") {
             out.push(path);
         }

@@ -1415,7 +1415,10 @@ async fn main() -> Result<()> {
         let relay_url = config.relay_url.clone().expect("agent mode implies --relay-url");
         let key = agent_key.clone().expect("checked above");
         let fps = config.uplink_fps;
-        tokio::spawn(async move { relay::task_uplink(ws, relay_url, key, fps).await });
+        let allow_install = config.allow_remote_install;
+        tokio::spawn(async move {
+            relay::task_uplink(ws, relay_url, key, fps, allow_install).await
+        });
     }
 
     // Server mode: the room replaces the polling tasks as the source of truth.
