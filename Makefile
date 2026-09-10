@@ -3,7 +3,7 @@ DASHBOARD_DIR := dashboard
 TARGET := x86_64-pc-windows-gnu
 DIST_DIR := dist
 
-.PHONY: all build-bridge build-bridge-cross build-dashboard build-all build-release prepare-dist serve dev clean install-deps
+.PHONY: all build-bridge build-bridge-cross build-dashboard build-all build-release build-server prepare-dist serve dev clean install-deps
 
 ## Default target
 all: build-all
@@ -28,6 +28,15 @@ build-bridge-cross:
 build-release: build-dashboard build-bridge
 	@echo ""
 	@echo "Release complete → $(DIST_DIR)/lmu-pitwall.exe"
+
+## Build the relay server for this host (Linux VPS), not Windows.
+## Same binary and same sources — run it with --server.
+build-server: build-dashboard
+	@echo "Building relay server for the host platform..."
+	@mkdir -p $(DIST_DIR)
+	cd $(BRIDGE_DIR) && cargo build --release
+	cp $(BRIDGE_DIR)/target/release/lmu-pitwall $(DIST_DIR)/lmu-pitwall-server
+	@echo "Built: $(DIST_DIR)/lmu-pitwall-server"
 
 ## Prepare dist/ for HTTP distribution (installer bundle + tar archive)
 ## Installer build requires: sudo dnf install wine && ./scripts/install-innosetup.sh
@@ -80,7 +89,7 @@ build-dashboard:
 	@echo "Built: $(DASHBOARD_DIR)/dist/"
 
 ## Build everything
-build-all: build-bridge build-dashboard
+build-all: build-dashboard build-bridge
 
 ## Start development servers
 ## Run in two terminals: 'make dev-bridge' and 'make dev-dashboard'
@@ -110,6 +119,7 @@ help:
 	@echo "LMU Pitwall — Makefile Targets"
 	@echo ""
 	@echo "  build-release       Build dashboard then .exe (single binary distribution)"
+	@echo "  build-server        Build the relay server for this host (run with --server)"
 	@echo "  prepare-dist        build-release + installer bundle + tar.gz in dist/"
 	@echo "  serve               prepare-dist + HTTP server on port 8080"
 	@echo "  build-bridge        Build Rust .exe only (cargo-zigbuild)"

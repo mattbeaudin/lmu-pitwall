@@ -43,6 +43,35 @@ connects while the game is running, that switch is the first thing to check.
 
 The dashboard auto-connects and updates in real time. On first run, Windows Firewall may prompt you to allow port 9000.
 
+### Agent mode — stream to a server (experimental)
+
+For teams that rotate drivers, the same binary can stream telemetry to a server
+instead of serving the dashboard from the racing PC. Everyone then watches one
+fixed URL, whoever is driving.
+
+On the server (Linux; `make build-server`):
+
+```bash
+PITWALL_AGENT_KEY=<shared-secret> ./lmu-pitwall-server --server
+```
+
+On the racing PC:
+
+```
+lmu-pitwall.exe --relay-url wss://your-host/uplink --agent-key <shared-secret> --headless
+```
+
+The agent that connects most recently is the source; starting an agent on another
+PC hands the stream over. Run the server behind a reverse proxy (Caddy, nginx) for
+TLS — it speaks plain HTTP itself.
+
+> **The viewing URL is public.** Only the agent needs a key; anyone who has the
+> address can watch the telemetry. That is deliberate — teams share the link — but
+> do not put the server on an address you would not want found.
+
+Post-Race, the Fuel Calculator, and the Race Engineer still run locally only;
+relaying viewer commands is the next step.
+
 ## Features
 
 | Widget | Description |

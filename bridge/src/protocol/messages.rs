@@ -359,7 +359,9 @@ pub enum ServerMessage {
     // -----------------------------------------------------------------------
     EngineerStatus {
         piper_installed: bool,
-        piper_version: &'static str,
+        /// `String` rather than `&'static str` so `ServerMessage` as a whole is
+        /// `DeserializeOwned`, which the relay needs to decode agent frames.
+        piper_version: String,
         voices: Vec<EngineerVoiceStatus>,
     },
 
