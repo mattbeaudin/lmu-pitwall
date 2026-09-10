@@ -71,7 +71,7 @@ async fn handle_connection(
         // The agent uplink is told apart from a viewer by path alone.
         match (&relay, parse_path(&preview).as_str()) {
             (Some(room), "/uplink") => room.accept_agent(stream, peer),
-            _ => ws.accept_client(stream, peer),
+            _ => ws.accept_client(stream, peer, relay.clone()),
         }
     } else {
         if let Err(e) = handle_http(stream, port, relay.is_some()).await {

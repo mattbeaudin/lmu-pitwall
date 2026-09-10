@@ -3,6 +3,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
 };
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
@@ -16,6 +17,7 @@ use crate::fuel_calculator::api::handle_command as fuel_handle;
 use crate::post_race::api::handle_command as post_race_handle;
 use crate::protocol::messages::{ClientCommand, ServerMessage};
 use crate::race_engineer::{self, RaceEngineerService};
+use crate::relay::room::{RelayRoom, RequestError};
 
 /// Broadcast channel capacity — number of queued messages per slow client
 /// before older messages are dropped (lagged receiver).
@@ -107,7 +109,16 @@ impl WebSocketServer {
     }
 
     /// Accept a single WebSocket client from an already-accepted `TcpStream`.
-    pub fn accept_client(&self, stream: TcpStream, peer: SocketAddr) {
+    ///
+    /// `relay` is `Some` only in server mode, and is passed per connection
+    /// rather than stored on the server: the room is built *from* an
+    /// `Arc<WebSocketServer>`, so holding one here would be a cycle.
+    pub fn accept_client(
+        &self,
+        stream: TcpStream,
+        peer: SocketAddr,
+        relay: Option<Arc<RelayRoom>>,
+    ) {
         info!("New WebSocket connection from {}", peer);
         let rx = self.tx.subscribe();
         let audio_rx = self.audio_tx.subscribe();
@@ -128,6 +139,7 @@ impl WebSocketServer {
             self.tx.clone(),
             self.audio_tx.clone(),
             self.engineer_service.clone(),
+            relay,
         ));
     }
 }
@@ -149,9 +161,11 @@ async fn handle_client(
     ws_broadcaster: broadcast::Sender<Arc<ServerMessage>>,
     _audio_broadcaster: broadcast::Sender<Arc<ServerMessage>>,
     engineer_service: Arc<RaceEngineerService>,
+    relay: Option<Arc<RelayRoom>>,
 ) {
     // Default role is audio — this device plays engineer callouts.
     let mut is_audio = true;
+    let mut command_rate = CommandRate::new();
     let is_json = Arc::new(AtomicBool::new(false));
     let is_json_cb = is_json.clone();
 
@@ -321,29 +335,25 @@ async fn handle_client(
                                         race_engineer::api::handle_command(cmd, svc, bcast, audio_bcast).await;
                                     });
                                 } else {
-                                    let response = tokio::task::spawn_blocking(move || {
-                                        dispatch_command(cmd)
-                                    })
-                                    .await;
-                                    match response {
-                                        Ok(msg) => {
-                                            match serialize(&msg, fmt) {
-                                                Ok(ws_msg) => {
-                                                    if let Err(e) = sink.send(ws_msg).await {
-                                                        debug!("Send to {} failed: {}", peer, e);
-                                                        break;
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    warn!(
-                                                        "Serialization error for {}: {}",
-                                                        peer, e
-                                                    );
-                                                }
+                                    // In server mode the data lives on the agent's PC,
+                                    // so the command makes a round trip. `relay` is
+                                    // None locally and this path is unchanged.
+                                    let msg = match &relay {
+                                        Some(room) if is_relayable(&cmd) => {
+                                            relay_command(room, &mut command_rate, cmd).await
+                                        }
+                                        _ => execute_local(cmd).await,
+                                    };
+
+                                    match serialize(&msg, fmt) {
+                                        Ok(ws_msg) => {
+                                            if let Err(e) = sink.send(ws_msg).await {
+                                                debug!("Send to {} failed: {}", peer, e);
+                                                break;
                                             }
                                         }
                                         Err(e) => {
-                                            warn!("Post-race task panicked for {}: {}", peer, e);
+                                            warn!("Serialization error for {}: {}", peer, e);
                                         }
                                     }
                                 }
@@ -385,6 +395,119 @@ fn dispatch_command(cmd: ClientCommand) -> ServerMessage {
     }
 }
 
+/// Send one viewer command down the relay, answering with the panel's own
+/// error variant when it cannot be served.
+async fn relay_command(
+    room: &Arc<RelayRoom>,
+    rate: &mut CommandRate,
+    cmd: ClientCommand,
+) -> ServerMessage {
+    if !rate.allow() {
+        return command_error(&cmd, "Too many requests — slow down".to_string());
+    }
+
+    let timeout = command_timeout(&cmd);
+    match room.request(cmd.clone(), timeout).await {
+        Ok(msg) => msg,
+        Err(RequestError::NoAgent) => {
+            command_error(&cmd, "No agent connected to this relay".to_string())
+        }
+        Err(RequestError::Timeout) => {
+            command_error(&cmd, "The agent did not answer in time".to_string())
+        }
+    }
+}
+
+/// Run a command on this machine.
+///
+/// Shared by the local socket path and the relay agent's downlink handler, so
+/// a remote viewer gets exactly what a local one would.
+pub(crate) async fn execute_local(cmd: ClientCommand) -> ServerMessage {
+    tokio::task::spawn_blocking(move || dispatch_command(cmd))
+        .await
+        .unwrap_or_else(|e| ServerMessage::PostRaceError {
+            message: format!("command task panicked: {e}"),
+        })
+}
+
+/// Whether a command may be sent down the relay to the agent's PC.
+///
+/// Listed explicitly rather than with a catch-all: anything a later phase adds
+/// must be opted in here, not forwarded to a driver's machine by accident.
+pub(crate) fn is_relayable(cmd: &ClientCommand) -> bool {
+    matches!(
+        cmd,
+        ClientCommand::PostRaceInit { .. }
+            | ClientCommand::PostRaceSessionDetail { .. }
+            | ClientCommand::PostRaceDriverLaps { .. }
+            | ClientCommand::PostRaceCompare { .. }
+            | ClientCommand::PostRaceStintSummary { .. }
+            | ClientCommand::PostRaceEvents { .. }
+            | ClientCommand::PostRaceFunFacts
+            | ClientCommand::FuelCalcInit
+            | ClientCommand::FuelCalcCompute { .. }
+    )
+}
+
+/// How long to wait for the agent's answer.
+///
+/// A cold `PostRaceInit` walks the results folder and parses every XML file
+/// (`post_race/importer.rs`), which is far more than a query's worth of work.
+pub(crate) fn command_timeout(cmd: &ClientCommand) -> Duration {
+    match cmd {
+        ClientCommand::PostRaceInit { .. } => Duration::from_secs(30),
+        _ => Duration::from_secs(10),
+    }
+}
+
+/// The error variant the panel that sent `cmd` knows how to render.
+///
+/// There are two, and picking the wrong one leaves the panel showing nothing.
+pub(crate) fn command_error(cmd: &ClientCommand, message: String) -> ServerMessage {
+    match cmd {
+        ClientCommand::FuelCalcInit | ClientCommand::FuelCalcCompute { .. } => {
+            ServerMessage::FuelCalcError { message }
+        }
+        _ => ServerMessage::PostRaceError { message },
+    }
+}
+
+/// Caps how fast one viewer socket may ask the agent to do work.
+///
+/// These are click-driven, so a few per second is generous. Only consulted on
+/// the relay path — a viewer there is anonymous, and the commands cost real
+/// work on someone else's PC.
+struct CommandRate {
+    tokens: f64,
+    last: Instant,
+}
+
+impl CommandRate {
+    const PER_SEC: f64 = 5.0;
+
+    fn new() -> Self {
+        CommandRate {
+            tokens: Self::PER_SEC,
+            last: Instant::now(),
+        }
+    }
+
+    fn allow(&mut self) -> bool {
+        let now = Instant::now();
+        self.tokens =
+            (self.tokens + now.duration_since(self.last).as_secs_f64() * Self::PER_SEC)
+                .min(Self::PER_SEC);
+        self.last = now;
+
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Serialization helpers
 // ---------------------------------------------------------------------------
@@ -399,5 +522,70 @@ fn serialize(msg: &ServerMessage, fmt: Format) -> Result<Message> {
             let text = serde_json::to_string(msg)?;
             Ok(Message::Text(text.into()))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Engineer commands install binaries and synthesize speech on the machine
+    /// they run on. They stay local; only data queries cross the relay.
+    #[test]
+    fn engineer_commands_are_not_relayable() {
+        assert!(!is_relayable(&ClientCommand::EngineerGetStatus));
+        assert!(!is_relayable(&ClientCommand::EngineerInstallPiper));
+        assert!(!is_relayable(&ClientCommand::EngineerRegisterClientRole {
+            role: "audio".to_string(),
+        }));
+    }
+
+    #[test]
+    fn post_race_and_fuel_commands_are_relayable() {
+        assert!(is_relayable(&ClientCommand::PostRaceFunFacts));
+        assert!(is_relayable(&ClientCommand::PostRaceInit { results_path: None }));
+        assert!(is_relayable(&ClientCommand::FuelCalcInit));
+    }
+
+    /// A cold import parses every result XML, so it gets far longer than a
+    /// query that only reads the database.
+    #[test]
+    fn a_cold_import_gets_the_long_timeout() {
+        assert_eq!(
+            command_timeout(&ClientCommand::PostRaceInit { results_path: None }),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            command_timeout(&ClientCommand::PostRaceFunFacts),
+            Duration::from_secs(10)
+        );
+    }
+
+    /// Two error variants exist and each panel renders only its own — the
+    /// wrong one shows the viewer nothing at all.
+    #[test]
+    fn errors_go_back_in_the_shape_the_panel_expects() {
+        assert!(matches!(
+            command_error(&ClientCommand::FuelCalcInit, "x".to_string()),
+            ServerMessage::FuelCalcError { .. }
+        ));
+        assert!(matches!(
+            command_error(&ClientCommand::PostRaceFunFacts, "x".to_string()),
+            ServerMessage::PostRaceError { .. }
+        ));
+    }
+
+    /// The bucket has to refill, or a viewer who clicks quickly once is capped
+    /// for the rest of the session.
+    #[test]
+    fn the_rate_limiter_allows_a_burst_then_refills() {
+        let mut rate = CommandRate::new();
+        for _ in 0..5 {
+            assert!(rate.allow());
+        }
+        assert!(!rate.allow());
+
+        rate.last = Instant::now() - Duration::from_secs(1);
+        assert!(rate.allow());
     }
 }

@@ -12,15 +12,15 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use futures_util::SinkExt;
-use tokio::sync::broadcast;
+use futures_util::{SinkExt, StreamExt};
+use tokio::sync::{broadcast, mpsc, Semaphore};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
 
 use crate::protocol::messages::ServerMessage;
-use crate::relay::envelope::UplinkFrame;
-use crate::websocket::server::WebSocketServer;
+use crate::relay::envelope::{DownlinkFrame, UplinkFrame};
+use crate::websocket::server::{command_error, execute_local, WebSocketServer};
 
 /// Reconnect backoff, same shape as the frontend's (`useWebSocket.ts`).
 const BASE_DELAY_MS: u64 = 1_000;
@@ -32,6 +32,15 @@ const THROUGHPUT_LOG_SECS: u64 = 30;
 /// A connection that lasted at least this long counts as healthy and resets the
 /// reconnect backoff.
 const STABLE_CONNECTION_SECS: u64 = 60;
+
+/// How many relayed commands may run at once.
+///
+/// Viewers are anonymous, and every one of these scans a directory or queries
+/// SQLite on the driver's PC. Beyond this the agent answers "busy" instead.
+const MAX_INFLIGHT_COMMANDS: usize = 4;
+
+/// Outbound frame queue depth for the writer task.
+const OUT_CAPACITY: usize = 64;
 
 /// Connect to `relay_url` and stream every broadcast message to it, forever.
 ///
@@ -90,22 +99,35 @@ async fn stream_once(
         format!("Bearer {}", agent_key).parse()?,
     );
 
-    let (mut sink, _incoming) = {
+    let (mut sink, mut incoming) = {
         let (stream, response) = tokio_tungstenite::connect_async(request).await?;
         debug!("Relay handshake status: {}", response.status());
-        futures_util::StreamExt::split(stream)
+        stream.split()
     };
 
     info!("Uplink connected to {}", relay_url);
 
+    // One writer owns the sink. Command answers finish out of order and must
+    // not race the telemetry stream for it.
+    let (out_tx, mut out_rx) = mpsc::channel::<Message>(OUT_CAPACITY);
+    tokio::spawn(async move {
+        while let Some(msg) = out_rx.recv().await {
+            if sink.send(msg).await.is_err() {
+                break;
+            }
+        }
+    });
+
     let hello = UplinkFrame::Hello {
         agent_version: env!("CARGO_PKG_VERSION").to_string(),
     };
-    sink.send(Message::Binary(rmp_serde::to_vec_named(&hello)?.into()))
+    out_tx
+        .send(Message::Binary(rmp_serde::to_vec_named(&hello)?.into()))
         .await?;
 
     let mut throttle = Throttle::new(uplink_fps);
     let mut meter = Meter::new();
+    let inflight = Arc::new(Semaphore::new(MAX_INFLIGHT_COMMANDS));
 
     loop {
         let msg = tokio::select! {
@@ -125,6 +147,23 @@ async fn stream_once(
                 }
                 Err(broadcast::error::RecvError::Closed) => return Ok(()),
             },
+            frame = incoming.next() => {
+                match frame {
+                    Some(Ok(Message::Binary(bytes))) => {
+                        match rmp_serde::from_slice::<DownlinkFrame>(&bytes) {
+                            Ok(DownlinkFrame::Command { req, cmd }) => {
+                                spawn_command(req, cmd, &inflight, &out_tx);
+                            }
+                            Err(e) => warn!("Undecodable downlink frame: {}", e),
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => return Ok(()),
+                    Some(Err(e)) => return Err(e.into()),
+                    // Text, ping and pong frames are not part of the downlink.
+                    Some(Ok(_)) => {}
+                }
+                continue;
+            }
         };
 
         if throttle.should_drop(&msg) {
@@ -133,7 +172,46 @@ async fn stream_once(
 
         let bytes = rmp_serde::to_vec_named(&UplinkFrame::Message((*msg).clone()))?;
         meter.record(bytes.len());
-        sink.send(Message::Binary(bytes.into())).await?;
+        out_tx.send(Message::Binary(bytes.into())).await?;
+    }
+}
+
+/// Run one relayed command off the main loop and answer with its `req`.
+///
+/// Spawned rather than awaited: a cold `PostRaceInit` takes tens of seconds,
+/// and blocking here would freeze every viewer's telemetry.
+fn spawn_command(
+    req: u64,
+    cmd: crate::protocol::messages::ClientCommand,
+    inflight: &Arc<Semaphore>,
+    out_tx: &mpsc::Sender<Message>,
+) {
+    let out_tx = out_tx.clone();
+    let permit = match inflight.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            // Answer anyway — a silent drop leaves the panel spinning until
+            // the server's timeout expires.
+            warn!("Too many relayed commands in flight, refusing request {}", req);
+            let msg = command_error(&cmd, "The agent is busy — try again".to_string());
+            tokio::spawn(async move { send_response(&out_tx, req, msg).await });
+            return;
+        }
+    };
+
+    tokio::spawn(async move {
+        let msg = execute_local(cmd).await;
+        send_response(&out_tx, req, msg).await;
+        drop(permit);
+    });
+}
+
+async fn send_response(out_tx: &mpsc::Sender<Message>, req: u64, msg: ServerMessage) {
+    match rmp_serde::to_vec_named(&UplinkFrame::Response { req, msg }) {
+        Ok(bytes) => {
+            let _ = out_tx.send(Message::Binary(bytes.into())).await;
+        }
+        Err(e) => warn!("Unserializable response for request {}: {}", req, e),
     }
 }
 

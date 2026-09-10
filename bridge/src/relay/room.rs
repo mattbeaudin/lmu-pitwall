@@ -7,21 +7,117 @@
 //!
 //! One room, one active source: a second agent takes over and the previous one
 //! is dropped. Teams rotate drivers by simply starting an agent.
+//!
+//! The room also carries viewer commands the other way. [`RelayRoom::request`]
+//! parks a `oneshot` under a fresh `req`, sends the command down to the agent
+//! and waits for the matching `Response` — that map is what keeps N viewers'
+//! answers from crossing.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
 
-use crate::protocol::messages::ServerMessage;
-use crate::relay::envelope::UplinkFrame;
+use crate::protocol::messages::{ClientCommand, ServerMessage};
+use crate::relay::envelope::{DownlinkFrame, UplinkFrame};
 use crate::websocket::server::WebSocketServer;
+
+/// How deep the queue to the agent may get before a send blocks.
+const DOWNLINK_CAPACITY: usize = 64;
+
+/// Why a relayed command produced no answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestError {
+    /// No agent is streaming, or the one that was went away mid-request.
+    NoAgent,
+    /// The agent is connected but did not answer in time.
+    Timeout,
+}
+
+/// The command channel to the current agent, plus who is waiting for answers.
+///
+/// `std::sync::Mutex` on purpose — every critical section is one map or option
+/// operation with no `.await` inside, so an async mutex would buy nothing.
+///
+/// Kept separate from [`RelayRoom`] so it can be constructed and tested on its
+/// own, without a `WebSocketServer`.
+#[derive(Default)]
+struct Downlink {
+    next_req: AtomicU64,
+    pending: Mutex<HashMap<u64, oneshot::Sender<ServerMessage>>>,
+    sender: Mutex<Option<mpsc::Sender<DownlinkFrame>>>,
+}
+
+impl Downlink {
+    /// Send `cmd` to the agent and wait for its answer.
+    async fn request(
+        &self,
+        cmd: ClientCommand,
+        timeout: Duration,
+    ) -> Result<ServerMessage, RequestError> {
+        let tx = self
+            .sender
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or(RequestError::NoAgent)?;
+
+        let req = self.next_req.fetch_add(1, Ordering::Relaxed);
+        let (res_tx, res_rx) = oneshot::channel();
+        self.pending.lock().unwrap().insert(req, res_tx);
+
+        if tx.send(DownlinkFrame::Command { req, cmd }).await.is_err() {
+            self.forget(req);
+            return Err(RequestError::NoAgent);
+        }
+
+        match tokio::time::timeout(timeout, res_rx).await {
+            Ok(Ok(msg)) => Ok(msg),
+            // The sender was dropped: the agent disconnected under us.
+            Ok(Err(_)) => Err(RequestError::NoAgent),
+            Err(_) => {
+                // Drop the entry here or a slow agent leaks one per timeout.
+                self.forget(req);
+                Err(RequestError::Timeout)
+            }
+        }
+    }
+
+    /// Hand one answer to the viewer that asked for it.
+    fn resolve(&self, req: u64, msg: ServerMessage) {
+        match self.pending.lock().unwrap().remove(&req) {
+            Some(tx) => {
+                let _ = tx.send(msg);
+            }
+            None => debug!("Response for unknown or timed-out request {}", req),
+        }
+    }
+
+    fn forget(&self, req: u64) {
+        self.pending.lock().unwrap().remove(&req);
+    }
+
+    /// Install the channel to a newly connected agent.
+    fn attach(&self, tx: mpsc::Sender<DownlinkFrame>) {
+        *self.sender.lock().unwrap() = Some(tx);
+    }
+
+    /// Drop the channel and wake every waiter. Dropping the `oneshot` senders
+    /// is what does the waking: `request` reads that as `NoAgent` and answers
+    /// immediately instead of leaving a viewer to time out against a dead agent.
+    fn detach(&self) {
+        *self.sender.lock().unwrap() = None;
+        self.pending.lock().unwrap().clear();
+    }
+}
 
 pub struct RelayRoom {
     agent_key: String,
@@ -34,6 +130,7 @@ pub struct RelayRoom {
     /// instead of an empty dashboard.
     all_drivers_tx: watch::Sender<Option<ServerMessage>>,
     connection_status_tx: watch::Sender<Option<ServerMessage>>,
+    downlink: Downlink,
 }
 
 impl RelayRoom {
@@ -51,7 +148,17 @@ impl RelayRoom {
             gen_tx,
             all_drivers_tx,
             connection_status_tx,
+            downlink: Downlink::default(),
         }
+    }
+
+    /// Run one viewer command on the agent's PC and return its answer.
+    pub async fn request(
+        &self,
+        cmd: ClientCommand,
+        timeout: Duration,
+    ) -> Result<ServerMessage, RequestError> {
+        self.downlink.request(cmd, timeout).await
     }
 
     /// Take over an already-accepted TCP connection on `/uplink`.
@@ -96,7 +203,26 @@ impl RelayRoom {
         let mut gen_rx = self.gen_tx.subscribe();
         info!("Agent {} connected (generation {})", peer, my_generation);
 
-        let (_sink, mut incoming) = ws_stream.split();
+        // The sink now belongs to a writer task: command answers arrive out of
+        // order, so writes have to be funnelled through one owner.
+        let (mut sink, mut incoming) = ws_stream.split();
+        let (out_tx, mut out_rx) = mpsc::channel::<DownlinkFrame>(DOWNLINK_CAPACITY);
+        self.downlink.attach(out_tx);
+
+        tokio::spawn(async move {
+            while let Some(frame) = out_rx.recv().await {
+                let bytes = match rmp_serde::to_vec_named(&frame) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        warn!("Undeliverable downlink frame: {}", e);
+                        continue;
+                    }
+                };
+                if sink.send(Message::Binary(bytes.into())).await.is_err() {
+                    break;
+                }
+            }
+        });
 
         loop {
             tokio::select! {
@@ -104,7 +230,7 @@ impl RelayRoom {
                 changed = gen_rx.changed() => {
                     if changed.is_err() || *gen_rx.borrow() != my_generation {
                         info!("Agent {} superseded by a newer agent", peer);
-                        return;
+                        break;
                     }
                 }
 
@@ -116,6 +242,9 @@ impl RelayRoom {
                                     info!("Agent {} says hello (v{})", peer, agent_version);
                                 }
                                 Ok(UplinkFrame::Message(msg)) => self.inject(msg),
+                                Ok(UplinkFrame::Response { req, msg }) => {
+                                    self.downlink.resolve(req, msg);
+                                }
                                 Err(e) => warn!("Undecodable frame from agent {}: {}", peer, e),
                             }
                         }
@@ -135,9 +264,11 @@ impl RelayRoom {
             }
         }
 
-        // Only the current agent's departure means the room has gone dark.
+        // Only the current agent's departure means the room has gone dark. A
+        // superseded agent must not tear down the replacement's downlink.
         if self.generation.load(Ordering::SeqCst) == my_generation {
             info!("Agent {} disconnected — room has no source", peer);
+            self.downlink.detach();
             self.inject(ServerMessage::ConnectionStatus {
                 game_connected: false,
                 plugin_version: String::new(),
@@ -253,6 +384,107 @@ mod tests {
             update_available: false,
         };
         assert_eq!(route_of(&version), Route::Drop);
+    }
+
+    fn error_stub(message: &str) -> ServerMessage {
+        ServerMessage::PostRaceError {
+            message: message.to_string(),
+        }
+    }
+
+    fn message_of(msg: ServerMessage) -> String {
+        match msg {
+            ServerMessage::PostRaceError { message } => message,
+            other => panic!("unexpected answer: {:?}", other),
+        }
+    }
+
+    /// With no agent streaming there is nothing to wait for, so the viewer must
+    /// be told at once rather than sitting out the full timeout.
+    #[tokio::test]
+    async fn request_without_an_agent_fails_immediately() {
+        let downlink = Downlink::default();
+        let err = downlink
+            .request(ClientCommand::PostRaceFunFacts, Duration::from_secs(30))
+            .await
+            .unwrap_err();
+        assert_eq!(err, RequestError::NoAgent);
+    }
+
+    /// The whole correctness argument for N viewers sharing one agent: two
+    /// requests answered out of order must still reach the right waiter.
+    #[tokio::test]
+    async fn interleaved_requests_do_not_cross() {
+        let downlink = Arc::new(Downlink::default());
+        let (tx, mut rx) = mpsc::channel(8);
+        downlink.attach(tx);
+
+        let a = tokio::spawn({
+            let d = downlink.clone();
+            async move {
+                d.request(ClientCommand::PostRaceFunFacts, Duration::from_secs(5))
+                    .await
+            }
+        });
+        let first = match rx.recv().await.unwrap() {
+            DownlinkFrame::Command { req, .. } => req,
+        };
+
+        let b = tokio::spawn({
+            let d = downlink.clone();
+            async move {
+                d.request(ClientCommand::PostRaceFunFacts, Duration::from_secs(5))
+                    .await
+            }
+        });
+        let second = match rx.recv().await.unwrap() {
+            DownlinkFrame::Command { req, .. } => req,
+        };
+        assert_ne!(first, second);
+
+        // Answer the second request first.
+        downlink.resolve(second, error_stub("second"));
+        downlink.resolve(first, error_stub("first"));
+
+        assert_eq!(message_of(a.await.unwrap().unwrap()), "first");
+        assert_eq!(message_of(b.await.unwrap().unwrap()), "second");
+    }
+
+    /// A timed-out request must not leave its entry behind, or a slow agent
+    /// leaks one per abandoned request.
+    #[tokio::test]
+    async fn a_timeout_removes_its_pending_entry() {
+        let downlink = Downlink::default();
+        let (tx, _rx) = mpsc::channel(8);
+        downlink.attach(tx);
+
+        let err = downlink
+            .request(ClientCommand::PostRaceFunFacts, Duration::from_millis(20))
+            .await
+            .unwrap_err();
+        assert_eq!(err, RequestError::Timeout);
+        assert!(downlink.pending.lock().unwrap().is_empty());
+    }
+
+    /// When the agent provably goes away, waiters hear about it now rather than
+    /// after 30 seconds.
+    #[tokio::test]
+    async fn detaching_wakes_every_waiter() {
+        let downlink = Arc::new(Downlink::default());
+        let (tx, mut rx) = mpsc::channel(8);
+        downlink.attach(tx);
+
+        let waiter = tokio::spawn({
+            let d = downlink.clone();
+            async move {
+                d.request(ClientCommand::PostRaceFunFacts, Duration::from_secs(30))
+                    .await
+            }
+        });
+        rx.recv().await.unwrap();
+
+        downlink.detach();
+        assert_eq!(waiter.await.unwrap().unwrap_err(), RequestError::NoAgent);
     }
 
     #[test]
