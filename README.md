@@ -69,8 +69,14 @@ TLS — it speaks plain HTTP itself.
 > address can watch the telemetry. That is deliberate — teams share the link — but
 > do not put the server on an address you would not want found.
 
-Post-Race, the Fuel Calculator, and the Race Engineer still run locally only;
-relaying viewer commands is the next step.
+Post-Race and the Fuel Calculator work for remote viewers — those commands make a
+round trip to the racing PC. The Race Engineer still runs locally only.
+
+> **Remote viewers can now cause work on the racing PC** — directory scans, XML
+> parsing and database queries — because those panels are unauthenticated like
+> the rest of the dashboard. Nothing is destructive and the results are already
+> public to the same people, but it is a load someone could abuse. Commands are
+> capped at 5/sec per viewer and 4 at a time on the agent.
 
 ## Features
 

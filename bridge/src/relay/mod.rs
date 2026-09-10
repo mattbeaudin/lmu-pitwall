@@ -6,9 +6,10 @@
 //! decodes those frames and pushes them straight back into the same broadcast
 //! channels the local dashboard already reads from, so viewer code is unchanged.
 //!
-//! Phase 1 relays server→viewer traffic only. Viewer commands (Post-Race, Fuel
-//! Calculator, Race Engineer) still need the downlink half, which is why
-//! [`envelope::UplinkFrame`] is a tagged enum from the start.
+//! Post-Race and Fuel Calculator commands travel the other way: the room sends
+//! an [`envelope::DownlinkFrame`] carrying a server-allocated `req`, and the
+//! agent answers with an `UplinkFrame::Response` holding the same `req`. The
+//! browser protocol is untouched — request ids exist only on this hop.
 
 pub mod envelope;
 pub mod room;

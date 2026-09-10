@@ -26,8 +26,10 @@ internally tagged on `type`, and nesting the two in one map round-trips poorly):
 
 | Frame | Shape | Meaning |
 |-------|-------|---------|
-| `Hello` | `{"Hello":{"agent_version":"1.2.3"}}` | First frame after the handshake |
-| `Message` | `{"Message":{<ServerMessage>}}` | Fan out to every viewer |
+| `Hello` | `{"Hello":{"agent_version":"1.2.3"}}` | Agent → server. First frame after the handshake |
+| `Message` | `{"Message":{<ServerMessage>}}` | Agent → server. Fan out to every viewer |
+| `Command` | `{"Command":{"req":7,"cmd":{<ClientCommand>}}}` | Server → agent. Run this on the driver's PC |
+| `Response` | `{"Response":{"req":7,"msg":{<ServerMessage>}}}` | Agent → server. Answer for exactly one viewer |
 
 **Rate.** `--uplink-fps` (default 10) limits `TelemetryUpdate` and
 `ScoringUpdate` only. Event-driven messages are never dropped.
@@ -37,8 +39,19 @@ viewers never receive WAV payloads. `VersionInfo` is *not* relayed — the serve
 reports its own version. `AllDriversUpdate` and `ConnectionStatus` also update
 the connect-time replay state so late-joining viewers see the session.
 
-Client→server commands (Post-Race, Fuel Calculator, Race Engineer) do not yet
-traverse the relay; they work only in local mode.
+**Commands.** Post-Race and Fuel Calculator commands make a round trip to the
+agent; every other command class, including the Race Engineer's, stays local.
+`ClientCommand` has no request id, so the server allocates `req` and matches the
+`Response` back to the viewer that asked — the browser protocol is unchanged and
+a viewer's identity never goes on the wire.
+
+`PostRaceInit` waits 30 s (a cold import parses every result XML), everything
+else 10 s. On timeout, or with no agent connected, the viewer gets
+`PostRaceError` or `FuelCalcError` — whichever its panel renders.
+
+**Limits.** Viewers are unauthenticated, so each socket is capped at 5 commands
+per second and the agent runs at most 4 at once; over either limit the answer is
+the same error variant, not silence.
 
 ## Message Types
 
