@@ -64,9 +64,9 @@ lmu-pitwall.exe --relay-url wss://your-host/uplink --agent-key <shared-secret> -
 ```
 
 The agent that connects most recently is the source; starting an agent on another
-PC hands the stream over. Run the server behind a reverse proxy (Caddy, nginx) for
-TLS — it speaks plain HTTP itself. `deploy/` has a systemd unit, a Caddyfile and
-step-by-step instructions.
+PC hands the stream over. Run the server behind a reverse proxy for TLS — it speaks
+plain HTTP itself. `deploy/` has a Docker Compose setup for running it behind Traefik,
+with step-by-step instructions.
 
 > **The viewing URL is public.** Only the agent needs a key; anyone who has the
 > address can watch the telemetry. That is deliberate — teams share the link — but

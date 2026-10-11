@@ -54,3 +54,7 @@ AGENTS.md
 
 # Real LMU result XMLs used for testing — they carry real drivers' names.
 /*.xml
+
+# Relay deployment secrets and the copied binary
+/deploy/.env
+/deploy/lmu-pitwall-server
