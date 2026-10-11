@@ -5,7 +5,7 @@
 //! - Unknown paths fall back to `index.html` for SPA client-side routing.
 //! - CORS headers are set so Android/remote browsers can connect freely.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -16,19 +16,24 @@ use tracing::{debug, info, warn};
 
 use crate::assets::Asset;
 use crate::relay::RelayRoom;
-use crate::websocket::server::WebSocketServer;
+use crate::websocket::server::{WebSocketServer, HANDSHAKE_TIMEOUT};
 
-/// Bind on `0.0.0.0:port` and serve HTTP + WebSocket connections.
+/// Bind on `bind:port` and serve HTTP + WebSocket connections.
 ///
 /// `relay` is `Some` only in server mode. Its presence both enables the
 /// `/uplink` route and disables the process-control API routes, which are safe
 /// on a driver's LAN but not on a public address.
-pub async fn run(ws: Arc<WebSocketServer>, port: u16, relay: Option<Arc<RelayRoom>>) -> Result<()> {
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+pub async fn run(
+    ws: Arc<WebSocketServer>,
+    bind: IpAddr,
+    port: u16,
+    relay: Option<Arc<RelayRoom>>,
+) -> Result<()> {
+    let addr = SocketAddr::new(bind, port);
     let listener = TcpListener::bind(addr).await?;
     info!(
-        "Dashboard available at http://0.0.0.0:{} — open http://localhost:{} in your browser",
-        port, port
+        "Dashboard available at http://{} — open http://localhost:{} in your browser",
+        addr, port
     );
 
     loop {
@@ -55,11 +60,17 @@ async fn handle_connection(
     relay: Option<Arc<RelayRoom>>,
 ) {
     // Peek without consuming so the WS handshake can re-read the same bytes.
+    // Bounded, as is the HTTP handler below: a socket that connects and sends
+    // nothing would otherwise hold its task forever.
     let mut buf = [0u8; 4096];
-    let n = match stream.peek(&mut buf).await {
-        Ok(n) => n,
-        Err(e) => {
+    let n = match tokio::time::timeout(HANDSHAKE_TIMEOUT, stream.peek(&mut buf)).await {
+        Ok(Ok(n)) => n,
+        Ok(Err(e)) => {
             debug!("Peek error from {}: {}", peer, e);
+            return;
+        }
+        Err(_) => {
+            debug!("No request from {} in time", peer);
             return;
         }
     };
@@ -85,12 +96,17 @@ async fn handle_connection(
 // ---------------------------------------------------------------------------
 
 async fn handle_http(mut stream: TcpStream, port: u16, server_mode: bool) -> Result<()> {
-    // Read until end of HTTP headers (\r\n\r\n).
+    // Read until end of HTTP headers (\r\n\r\n). The deadline covers the whole
+    // header, not each read — trickling one byte at a time must not reset it.
+    // The response is not bounded: a slow phone may need longer for the bundle.
     let mut request = Vec::with_capacity(2048);
     let mut buf = [0u8; 4096];
+    let deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
 
     loop {
-        let n = stream.read(&mut buf).await?;
+        let n = tokio::time::timeout_at(deadline, stream.read(&mut buf))
+            .await
+            .map_err(|_| anyhow::anyhow!("request headers not received in time"))??;
         if n == 0 {
             break;
         }
@@ -140,7 +156,13 @@ async fn handle_http(mut stream: TcpStream, port: u16, server_mode: bool) -> Res
     }
 
     if path == "/api/version" {
-        let body = format!(r#"{{"version":"{}"}}"#, env!("CARGO_PKG_VERSION"));
+        // `relay` tells the dashboard to hide the panels a view-only relay
+        // refuses (Post-Race, Fuel Calculator, Race Engineer).
+        let body = format!(
+            r#"{{"version":"{}","relay":{}}}"#,
+            env!("CARGO_PKG_VERSION"),
+            server_mode
+        );
         let cors = [
             ("Access-Control-Allow-Origin", "*"),
             ("Access-Control-Allow-Methods", "GET, OPTIONS"),

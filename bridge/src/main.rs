@@ -1361,6 +1361,17 @@ async fn main() -> Result<()> {
             mode
         );
     }
+    // The relay sets the key, so it is where a weak one is refused. It sits on
+    // a public address and is the only thing standing between anyone and
+    // impersonating the driver's stream.
+    if mode == Mode::Server {
+        let key = agent_key.as_deref().unwrap_or_default();
+        if key.len() < 32 || key == "change-me" {
+            anyhow::bail!(
+                "the agent key must be at least 32 characters — generate one with `openssl rand -hex 32`"
+            );
+        }
+    }
 
     // Watch channel for latest AllDriversUpdate (sent to new clients on connect).
     let (all_drivers_tx, all_drivers_rx) =
@@ -1438,10 +1449,17 @@ async fn main() -> Result<()> {
     if !(mode == Mode::Agent && config.headless) {
         let ws   = ws.clone();
         let http_port = port;
+        let bind = config.bind;
         let relay = relay_room.clone();
         tokio::spawn(async move {
-            if let Err(e) = http_server::run(ws, http_port, relay).await {
+            if let Err(e) = http_server::run(ws, bind, http_port, relay).await {
                 tracing::error!("HTTP server error: {}", e);
+                // A relay that cannot bind serves nothing and has no other job.
+                // Exit so systemd restarts it and the failure shows up in
+                // `systemctl status` instead of only in the log.
+                if mode == Mode::Server {
+                    std::process::exit(1);
+                }
             }
         });
     }

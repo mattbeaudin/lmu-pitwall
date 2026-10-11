@@ -1,0 +1,42 @@
+# LMU Pitwall relay behind an existing Traefik. See README.md.
+#
+# Needs a `.env` next to this file (never commit it):
+#     PITWALL_HOST=pitwall.example.com
+#     PITWALL_AGENT_KEY=<openssl rand -hex 32>
+# The key is passed into the container; the host only drives the router rule.
+
+services:
+  lmu-pitwall:
+    build: .
+    image: lmu-pitwall-relay
+    restart: unless-stopped
+    environment:
+      PITWALL_AGENT_KEY: ${PITWALL_AGENT_KEY:?set PITWALL_AGENT_KEY in .env}
+      # The log file goes to $APPDATA; the root filesystem is read-only.
+      APPDATA: /tmp
+    # No `ports:` — Traefik reaches the relay over the shared network, so 9000
+    # is never published on the host.
+    networks: [proxy]
+
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    # One room, at most 20 viewers. Generous ceilings that still stop a runaway
+    # process from taking the VPS with it.
+    mem_limit: 256m
+    pids_limit: 256
+
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: ${TRAEFIK_NETWORK:-traefik}
+      traefik.http.routers.lmu-pitwall.rule: Host(`${PITWALL_HOST:?set PITWALL_HOST in .env}`)
+      # Match these two to your Traefik's entrypoint and certificate resolver.
+      traefik.http.routers.lmu-pitwall.entrypoints: websecure
+      traefik.http.routers.lmu-pitwall.tls.certresolver: letsencrypt
+      traefik.http.services.lmu-pitwall.loadbalancer.server.port: "9000"
+
+networks:
+  proxy:
+    external: true
+    name: ${TRAEFIK_NETWORK:-traefik}
