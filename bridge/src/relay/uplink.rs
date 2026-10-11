@@ -21,7 +21,10 @@ use tracing::{debug, info, warn};
 use crate::protocol::messages::{ClientCommand, ServerMessage};
 use crate::race_engineer;
 use crate::relay::envelope::{DownlinkFrame, UplinkFrame};
-use crate::websocket::server::{command_error, execute_local, WebSocketServer};
+use crate::websocket::server::{
+    command_error, execute_local, is_engineer_message, relay_refusal, WebSocketServer,
+    RELAY_COMMANDS,
+};
 
 /// Reconnect backoff, same shape as the frontend's (`useWebSocket.ts`).
 const BASE_DELAY_MS: u64 = 1_000;
@@ -150,7 +153,8 @@ async fn stream_once(
                 }
                 Err(broadcast::error::RecvError::Closed) => return Ok(()),
             },
-            result = audio_rx.recv() => match result {
+            // Engineer audio is not uploaded while the relay is view-only.
+            result = audio_rx.recv(), if RELAY_COMMANDS => match result {
                 Ok(msg) => msg,
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     warn!("Uplink audio lagged, dropped {} messages", n);
@@ -162,6 +166,20 @@ async fn stream_once(
                 match frame {
                     Some(Ok(Message::Binary(bytes))) => {
                         match rmp_serde::from_slice::<DownlinkFrame>(&bytes) {
+                            // This PC refuses relay commands itself rather than
+                            // trusting the relay not to send them — it is the
+                            // machine at risk. Answer so the relay does not wait
+                            // out its timeout.
+                            Ok(DownlinkFrame::Command { req, cmd }) if !RELAY_COMMANDS => {
+                                warn!("Refused a relayed command: {:?}", cmd);
+                                let out_tx = out_tx.clone();
+                                tokio::spawn(async move {
+                                    send_response(&out_tx, req, relay_refusal(&cmd)).await
+                                });
+                            }
+                            Ok(DownlinkFrame::Broadcast { cmd }) if !RELAY_COMMANDS => {
+                                warn!("Refused a relayed engineer command: {:?}", cmd);
+                            }
                             Ok(DownlinkFrame::Command { req, cmd }) => {
                                 spawn_command(req, cmd, &inflight, &out_tx);
                             }
@@ -186,7 +204,7 @@ async fn stream_once(
             }
         };
 
-        if throttle.should_drop(&msg) {
+        if (!RELAY_COMMANDS && is_engineer_message(&msg)) || throttle.should_drop(&msg) {
             continue;
         }
 

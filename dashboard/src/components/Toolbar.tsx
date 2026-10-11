@@ -102,6 +102,19 @@ export default function Toolbar({ onOpenSettings, onOpenResults, onOpenFuel, onO
 }) {
   const { activePreset, locked, setPreset, resetToDefault, toggleLock, addWidget } = useLayoutStore()
   const fullscreen = useSettingsStore((s) => s.fullscreen)
+  const wsHost = useSettingsStore((s) => s.wsHost)
+  const wsPort = useSettingsStore((s) => s.wsPort)
+
+  // A relay is view-only: it refuses Post-Race, Fuel Calculator and Race
+  // Engineer commands, so their buttons are hidden there. The FuelManager
+  // widget covers live fuel from the streamed telemetry.
+  const [relay, setRelay] = useState(false)
+  useEffect(() => {
+    fetch(`${bridgeHttpBase()}/api/version`)
+      .then((r) => r.json())
+      .then((data: { relay?: boolean }) => setRelay(data.relay === true))
+      .catch(() => {})
+  }, [wsHost, wsPort])
 
   const toggleFullscreen = useCallback(() => {
     if (!document.fullscreenElement) {
@@ -190,14 +203,18 @@ export default function Toolbar({ onOpenSettings, onOpenResults, onOpenFuel, onO
       {/* Spacer */}
       <div style={{ flex: 1 }} />
 
-      {/* Race Engineer */}
-      <ToolbarBtn onClick={onOpenEngineer} title="Race Engineer" active={engineerOpen}>🎙</ToolbarBtn>
+      {!relay && (
+        <>
+          {/* Race Engineer */}
+          <ToolbarBtn onClick={onOpenEngineer} title="Race Engineer" active={engineerOpen}>🎙</ToolbarBtn>
 
-      {/* Fuel Calculator */}
-      <ToolbarBtn onClick={onOpenFuel} title="Fuel Calculator" active={fuelOpen}>⛽</ToolbarBtn>
+          {/* Fuel Calculator */}
+          <ToolbarBtn onClick={onOpenFuel} title="Fuel Calculator" active={fuelOpen}>⛽</ToolbarBtn>
 
-      {/* Post Race Results */}
-      <ToolbarBtn onClick={onOpenResults} title="Post Race Results" active={resultsOpen}>📋</ToolbarBtn>
+          {/* Post Race Results */}
+          <ToolbarBtn onClick={onOpenResults} title="Post Race Results" active={resultsOpen}>📋</ToolbarBtn>
+        </>
+      )}
 
       {/* Lock */}
       <ToolbarBtn

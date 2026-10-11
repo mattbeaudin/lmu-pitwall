@@ -62,8 +62,17 @@ pub struct Config {
     /// Agent mode only — let relay viewers install Piper and voices on this
     /// PC. Off by default: viewers are unauthenticated, and an install writes
     /// a downloaded binary to the driver's machine.
+    ///
+    /// Inert while `RELAY_COMMANDS` (`websocket/server.rs`) is off: the agent
+    /// then refuses every relayed command, installs included.
     #[arg(long, default_value_t = false)]
     pub allow_remote_install: bool,
+
+    /// Address to listen on. Default all interfaces, which a driver's LAN
+    /// needs. A relay behind a reverse proxy should bind only what the proxy
+    /// reaches, e.g. `127.0.0.1`, so port 9000 is never public.
+    #[arg(long, default_value = "0.0.0.0")]
+    pub bind: std::net::IpAddr,
 
     /// Uplink send rate for telemetry and scoring frames. Deliberately lower
     /// than `--telemetry-fps`: the uplink runs over a home upstream link,

@@ -29,7 +29,14 @@ use tracing::{debug, info, warn};
 
 use crate::protocol::messages::{ClientCommand, ServerMessage};
 use crate::relay::envelope::{DownlinkFrame, UplinkFrame};
-use crate::websocket::server::WebSocketServer;
+use crate::websocket::server::{
+    is_engineer_message, WebSocketServer, HANDSHAKE_TIMEOUT, RELAY_COMMANDS,
+};
+
+/// Largest frame the agent may send. A full grid's `ScoringUpdate` is tens of
+/// KB; the tungstenite default (64 MiB) is far beyond anything legitimate and
+/// applies before the key has been checked.
+const MAX_UPLINK_FRAME: usize = 1024 * 1024;
 
 /// How deep the queue to the agent may get before a send blocks.
 const DOWNLINK_CAPACITY: usize = 64;
@@ -209,7 +216,11 @@ impl RelayRoom {
 
     async fn handle_agent(self: Arc<Self>, stream: TcpStream, peer: SocketAddr) {
         let expected = self.agent_key.clone();
-        let ws_stream = match tokio_tungstenite::accept_hdr_async(
+        let mut config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
+        config.max_message_size = Some(MAX_UPLINK_FRAME);
+        config.max_frame_size = Some(MAX_UPLINK_FRAME);
+
+        let handshake = tokio_tungstenite::accept_hdr_async_with_config(
             stream,
             move |req: &Request, resp: Response| {
                 let presented = req
@@ -227,12 +238,16 @@ impl RelayRoom {
                     Err(err)
                 }
             },
-        )
-        .await
-        {
-            Ok(s) => s,
-            Err(e) => {
+            Some(config),
+        );
+        let ws_stream = match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
                 warn!("Agent handshake rejected for {}: {}", peer, e);
+                return;
+            }
+            Err(_) => {
+                warn!("Agent handshake timed out for {}", peer);
                 return;
             }
         };
@@ -356,6 +371,10 @@ enum Route {
 
 fn route_of(msg: &ServerMessage) -> Route {
     match msg {
+        // The relay is view-only (`RELAY_COMMANDS` off), so the engineer does
+        // not reach viewers. Current agents no longer upload it; this drops
+        // what an older agent still sends.
+        m if !RELAY_COMMANDS && is_engineer_message(m) => Route::Drop,
         // Must stay on the audio channel, or viewers registered `display_only`
         // receive every WAV payload the engineer produces.
         ServerMessage::EngineerAudio { .. } => Route::Audio,
@@ -413,7 +432,21 @@ mod tests {
             duration_ms: 0,
             text: String::new(),
         };
-        assert_eq!(route_of(&audio), Route::Audio);
+        let expected = if RELAY_COMMANDS { Route::Audio } else { Route::Drop };
+        assert_eq!(route_of(&audio), expected);
+    }
+
+    /// An older agent still uploads engineer traffic; a view-only relay must
+    /// not pass it on.
+    #[test]
+    fn engineer_traffic_is_dropped_on_a_view_only_relay() {
+        if RELAY_COMMANDS {
+            return;
+        }
+        let err = ServerMessage::EngineerError {
+            message: String::new(),
+        };
+        assert_eq!(route_of(&err), Route::Drop);
     }
 
     #[test]

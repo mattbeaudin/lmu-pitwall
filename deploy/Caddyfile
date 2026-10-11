@@ -1,0 +1,9 @@
+# Caddy cannot obtain a certificate for a bare IP address — point a hostname at
+# the server first.
+#
+# Caddy upgrades WebSocket connections and obtains a Let's Encrypt certificate
+# with no further configuration. That is why TLS is not in the binary.
+
+pitwall.example.com {
+	reverse_proxy 127.0.0.1:9000
+}

@@ -43,7 +43,7 @@ connects while the game is running, that switch is the first thing to check.
 
 The dashboard auto-connects and updates in real time. On first run, Windows Firewall may prompt you to allow port 9000.
 
-### Agent mode — stream to a server (experimental)
+### Agent mode — stream to a server
 
 For teams that rotate drivers, the same binary can stream telemetry to a server
 instead of serving the dashboard from the racing PC. Everyone then watches one
@@ -52,8 +52,10 @@ fixed URL, whoever is driving.
 On the server (Linux; `make build-server`):
 
 ```bash
-PITWALL_AGENT_KEY=<shared-secret> ./lmu-pitwall-server --server
+PITWALL_AGENT_KEY=$(openssl rand -hex 32) ./lmu-pitwall-server --server --bind 127.0.0.1
 ```
+
+The key must be at least 32 characters.
 
 On the racing PC:
 
@@ -63,20 +65,18 @@ lmu-pitwall.exe --relay-url wss://your-host/uplink --agent-key <shared-secret> -
 
 The agent that connects most recently is the source; starting an agent on another
 PC hands the stream over. Run the server behind a reverse proxy (Caddy, nginx) for
-TLS — it speaks plain HTTP itself.
+TLS — it speaks plain HTTP itself. `deploy/` has a systemd unit, a Caddyfile and
+step-by-step instructions.
 
 > **The viewing URL is public.** Only the agent needs a key; anyone who has the
 > address can watch the telemetry. That is deliberate — teams share the link — but
 > do not put the server on an address you would not want found.
 
-Post-Race and the Fuel Calculator work for remote viewers — those commands make a
-round trip to the racing PC. The Race Engineer still runs locally only.
-
-> **Remote viewers can now cause work on the racing PC** — directory scans, XML
-> parsing and database queries — because those panels are unauthenticated like
-> the rest of the dashboard. Nothing is destructive and the results are already
-> public to the same people, but it is a load someone could abuse. Commands are
-> capped at 5/sec per viewer and 4 at a time on the agent.
+The relay is **view-only**: the stream goes one way, from the racing PC out, and
+nothing a viewer does reaches the racing PC. Post-Race, the Fuel Calculator and the
+Race Engineer stay on the driver's local dashboard; their buttons are hidden on the
+relay, and engineer audio is not uploaded. Live fuel and VE are still there for
+viewers through the Fuel widget, which works from the streamed telemetry.
 
 ## Features
 

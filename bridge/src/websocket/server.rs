@@ -32,6 +32,12 @@ const BROADCAST_CAPACITY: usize = 128;
 /// agent's uplink is not a viewer and is not counted — it never reaches here.
 const MAX_CLIENTS: usize = 20;
 
+/// How long a connection may take to send its request headers or finish a
+/// WebSocket handshake. Shared by the HTTP front door, viewers and the agent
+/// uplink: a socket that connects and then says nothing would otherwise hold
+/// a task (and, for viewers, one of the [`MAX_CLIENTS`] slots) forever.
+pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Wire serialization format negotiated per-client via query parameter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
@@ -206,30 +212,34 @@ async fn handle_client(
     let is_json = Arc::new(AtomicBool::new(false));
     let is_json_cb = is_json.clone();
 
-    let ws =
-        match tokio_tungstenite::accept_hdr_async_with_config(
-            stream,
-            move |req: &Request, resp: Response| {
-                let json_requested = req
-                    .uri()
-                    .query()
-                    .map(|q| q.split('&').any(|p| p == "format=json"))
-                    .unwrap_or(false);
-                if json_requested {
-                    is_json_cb.store(true, Ordering::Relaxed);
-                }
-                Ok(resp)
-            },
-            Some(client_ws_config()),
-        )
-        .await
-        {
-            Ok(ws) => ws,
-            Err(e) => {
-                warn!("WebSocket handshake failed for {}: {}", peer, e);
-                return;
+    // Bounded: the slot above is already held, so without a deadline
+    // MAX_CLIENTS sockets that never finish the handshake lock everyone out.
+    let handshake = tokio_tungstenite::accept_hdr_async_with_config(
+        stream,
+        move |req: &Request, resp: Response| {
+            let json_requested = req
+                .uri()
+                .query()
+                .map(|q| q.split('&').any(|p| p == "format=json"))
+                .unwrap_or(false);
+            if json_requested {
+                is_json_cb.store(true, Ordering::Relaxed);
             }
-        };
+            Ok(resp)
+        },
+        Some(client_ws_config()),
+    );
+    let ws = match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake).await {
+        Ok(Ok(ws)) => ws,
+        Ok(Err(e)) => {
+            warn!("WebSocket handshake failed for {}: {}", peer, e);
+            return;
+        }
+        Err(_) => {
+            warn!("WebSocket handshake timed out for {}", peer);
+            return;
+        }
+    };
 
     let fmt = if is_json.load(Ordering::Relaxed) {
         Format::Json
@@ -358,6 +368,24 @@ async fn handle_client(
                                     continue;
                                 }
 
+                                // The relay is view-only: nothing a viewer
+                                // sends may reach the driver's PC, and nothing
+                                // may run on the VPS either.
+                                if relay.is_some() && !RELAY_COMMANDS {
+                                    match serialize(&relay_refusal(&cmd), fmt) {
+                                        Ok(ws_msg) => {
+                                            if let Err(e) = sink.send(ws_msg).await {
+                                                debug!("Send to {} failed: {}", peer, e);
+                                                break;
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!("Serialization error for {}: {}", peer, e);
+                                        }
+                                    }
+                                    continue;
+                                }
+
                                 if is_engineer(&cmd) {
                                     // In server mode the engineer — Piper, the
                                     // voices and the rule engine — lives on the
@@ -402,7 +430,9 @@ async fn handle_client(
                                         Some(room) if is_relayable(&cmd) => {
                                             relay_command(room, &mut command_rate, cmd).await
                                         }
-                                        _ => execute_local(cmd).await,
+                                        // Never run a viewer's command on the VPS.
+                                        Some(_) => relay_refusal(&cmd),
+                                        None => execute_local(cmd).await,
                                     };
 
                                     match serialize(&msg, fmt) {
@@ -555,6 +585,26 @@ pub(crate) async fn execute_local(cmd: ClientCommand) -> ServerMessage {
         })
 }
 
+/// Whether the relay forwards viewer commands to the agent at all.
+///
+/// Off: the relay is view-only. Post-Race, the Fuel Calculator and the Race
+/// Engineer are answered with [`relay_refusal`] and never reach the driver's
+/// PC, which also refuses them on its side (`relay/uplink.rs`). The relay
+/// paths below are kept, not deleted, so turning this back on is one line —
+/// but every viewer is anonymous, so do that deliberately.
+pub(crate) const RELAY_COMMANDS: bool = false;
+
+/// The answer a relay viewer gets for a command the relay will not serve,
+/// in the error variant its panel renders.
+pub(crate) fn relay_refusal(cmd: &ClientCommand) -> ServerMessage {
+    let message = "Not available on the relay".to_string();
+    if is_engineer(cmd) {
+        ServerMessage::EngineerError { message }
+    } else {
+        command_error(cmd, message)
+    }
+}
+
 /// Whether a command may be sent down the relay to the agent's PC.
 ///
 /// Listed explicitly rather than with a catch-all: anything a later phase adds
@@ -588,6 +638,19 @@ pub(crate) fn is_engineer(cmd: &ClientCommand) -> bool {
             | ClientCommand::EngineerUninstallVoice { .. }
             | ClientCommand::EngineerSynthesize { .. }
             | ClientCommand::EngineerUpdateBehavior { .. }
+    )
+}
+
+/// Whether a message is Race Engineer output — what a view-only relay neither
+/// uploads (agent) nor passes on (relay).
+pub(crate) fn is_engineer_message(msg: &ServerMessage) -> bool {
+    matches!(
+        msg,
+        ServerMessage::EngineerStatus { .. }
+            | ServerMessage::EngineerInstallProgress { .. }
+            | ServerMessage::EngineerInstallComplete { .. }
+            | ServerMessage::EngineerAudio { .. }
+            | ServerMessage::EngineerError { .. }
     )
 }
 
@@ -734,6 +797,30 @@ mod tests {
             role: "display_only".to_string(),
         }));
         assert!(!is_engineer(&ClientCommand::PostRaceFunFacts));
+    }
+
+    /// Every viewer command on the relay gets a refusal its own panel renders —
+    /// the wrong variant leaves the panel spinning instead of showing why.
+    #[test]
+    fn relay_refuses_every_command_in_the_panels_own_variant() {
+        assert!(!RELAY_COMMANDS);
+        for cmd in [
+            ClientCommand::PostRaceInit { results_path: None },
+            ClientCommand::PostRaceFunFacts,
+        ] {
+            assert!(matches!(relay_refusal(&cmd), ServerMessage::PostRaceError { .. }));
+        }
+        assert!(matches!(
+            relay_refusal(&ClientCommand::FuelCalcInit),
+            ServerMessage::FuelCalcError { .. }
+        ));
+        for cmd in [
+            ClientCommand::EngineerGetStatus,
+            ClientCommand::EngineerInstallPiper,
+            behavior_stub(),
+        ] {
+            assert!(matches!(relay_refusal(&cmd), ServerMessage::EngineerError { .. }));
+        }
     }
 
     fn behavior_stub() -> ClientCommand {
